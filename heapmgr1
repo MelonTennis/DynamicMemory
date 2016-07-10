@@ -1,0 +1,476 @@
+/*--------------------------------------------------------*/
+/*heapmagr1.c for assignment 6                            */
+/*Modified by Yijia JIN 20156005                          */
+/*--------------------------------------------------------*/
+#include "heapmgr.h"
+#include "chunk.h"
+#include <stddef.h>
+#include <string.h>
+#include <stdio.h> /* For debugging */
+#include <assert.h>
+
+#define __USE_MISC
+#include <unistd.h>
+
+enum {MIN_UNITS_FROM_OS = 1024};
+/* The minimum number of units to request of the OS. */
+
+/*---------------------------------------------------------------------------*/
+
+/* The state of the HeapMgr. */
+
+static Chunk_T oHeapStart = NULL;
+/* The address of the start of the heap. */
+
+static Chunk_T oHeapEnd = NULL;
+/* The address immediately beyond the end of the heap. */
+
+static Chunk_T oFreeList = NULL;
+/* The free list is a list of all free Chunks. */
+
+/*---------------------------------------------------------------------------*/
+
+void HeapMgr_printFreeChunks(void)
+
+/* Print the free chunks. */
+
+{
+  Chunk_T oChunk;
+  int i = 1;
+
+  for (oChunk = oFreeList; oChunk; oChunk = Chunk_getNextInList(oChunk)) {
+    printf("Free chunk %d: %u units\n", i++, Chunk_getUnits(oChunk));
+  }
+  
+  if (i == 1)
+    printf("No free chunks\n");
+}
+
+/*---------------------------------------------------------------------------*/
+
+#ifndef NDEBUG
+
+static int HeapMgr_isValid(void)
+
+/* Return 1 (TRUE) iff the heap manager is in a valid state. */
+
+{
+  Chunk_T oChunk;
+  Chunk_T oPrevChunk;
+  Chunk_T oNextChunk;
+  if(oHeapStart==NULL)
+    {
+      fprintf(stderr,"Uninitialized heap start\n");
+      return 0;
+    }
+  if(oHeapEnd==NULL)
+    {
+      fprintf(stderr,"Uninitialized heap end\n");
+      return 0;
+    }
+  if(oHeapStart==oHeapEnd)
+    {
+      if(oFreeList==NULL)
+	return 1;
+      else
+	{
+	  fprintf(stderr,"Inconsistent empty heap\n");
+	  return 0;
+	}
+    }
+  /* Tranverse memory.*/
+  for(oChunk=oHeapStart;
+      oChunk!=NULL;
+      oChunk = Chunk_getNextInMem(oChunk,oHeapStart,oHeapEnd))
+    {
+      if(!Chunk_isValid(oChunk,oHeapStart,oHeapEnd))/*Check validity*/
+	{
+	  fprintf(stderr,"Invalid chunk\n");
+	  return 0;
+	}
+      if(Chunk_getStatus(oChunk)==CHUNK_FREE)/*Check free.*/
+	{
+	  if(oChunk!=oFreeList)
+	    {
+	      if(Chunk_getPrevInList(oChunk)==NULL
+		 && Chunk_getNextInList(oChunk)==NULL)
+		return 0;
+	    }
+	}
+    }
+  /*Tranverse the free list.*/
+
+  for(oChunk=oFreeList;
+      oChunk!=NULL;
+      oChunk=Chunk_getNextInList(oChunk))
+    {
+      if(!Chunk_isValid(oChunk,oHeapStart,oHeapEnd))/*Check validity.*/
+	return 0;
+      if(Chunk_getStatus(oChunk)==CHUNK_INUSE)/*Check INUSE in free list.*/
+	return 0;
+      /*Check uncoalesceed chunks.*/
+      oPrevChunk=Chunk_getPrevInMem(oChunk,oHeapStart,oHeapEnd);
+      oNextChunk=Chunk_getNextInMem(oChunk,oHeapStart,oHeapEnd);
+      if(oPrevChunk!=NULL)
+	if(Chunk_getStatus(oPrevChunk)==CHUNK_FREE)
+	{
+	  fprintf(stderr,"Uncoalesced chunks\n");
+	  return 0;
+	}
+      if(oNextChunk!=NULL)
+	{
+	  if(Chunk_getStatus(oNextChunk)==CHUNK_FREE)
+	    {
+	      fprintf(stderr, "Uncoalesced chunks.\n");
+	      return 0;
+	    }
+	}
+    }
+  return 1;
+}
+#endif
+
+/*---------------------------------------------------------------------------*/
+static Chunk_T HeapMgr_Remove(Chunk_T oChunk)
+/* Remove chunk from the list.*/
+{
+  Chunk_T oNextChunk;
+  Chunk_T oPrevChunk;
+  assert(oChunk!=NULL);
+  oPrevChunk=Chunk_getPrevInList(oChunk);
+  oNextChunk=Chunk_getNextInList(oChunk);
+  if(oPrevChunk!=NULL)
+    {
+      Chunk_setNextInList(oPrevChunk,oNextChunk);
+      if(oNextChunk!=NULL)
+	Chunk_setPrevInList(oNextChunk,oPrevChunk);
+      Chunk_setPrevInList(oChunk,NULL);
+      Chunk_setNextInList(oChunk,NULL);
+      return oChunk;
+    }  
+  else    
+    {
+      if(oNextChunk!=NULL)
+	  Chunk_setPrevInList(oNextChunk,NULL);   
+	  oFreeList=oNextChunk;
+	  Chunk_setNextInList(oChunk,NULL);
+	  Chunk_setPrevInList(oChunk,NULL);
+	  return oChunk;
+    }
+} 
+/*---------------------------------------------------------------*/
+static Chunk_T HeapMgr_Insert(Chunk_T oChunk)
+/*Insert the chunk in the head of the list.*/
+{
+  assert(oChunk!=NULL);
+  if(oFreeList==NULL)
+    {
+      oFreeList=oChunk;
+      Chunk_setPrevInList(oChunk,NULL);
+      Chunk_setStatus(oChunk,CHUNK_FREE);
+      return oChunk;
+    }
+  else 
+    {
+      Chunk_setPrevInList(oChunk,NULL);
+      Chunk_setNextInList(oChunk,oFreeList);
+      Chunk_setPrevInList(oFreeList,oChunk);
+      oFreeList=oChunk;
+      Chunk_setStatus(oChunk,CHUNK_FREE);
+      return oChunk;
+    }
+}
+/*--------------------------------------------------------------------*/
+  static Chunk_T HeapMgr_getMoreMemory(Chunk_T oPrevChunk, size_t uiUnits)
+/* Request more memory form the operating system--enough to store
+   unUnits units. Creat a new chunk, and either append it to the 
+   free list after oPrevChunk or increase the size of oPrevchunk.*/
+{
+  Chunk_T oChunk;
+  if(uiUnits<MIN_UNITS_FROM_OS)
+    uiUnits=MIN_UNITS_FROM_OS;
+
+  /*Move the break.*/
+  oChunk=(Chunk_T)sbrk(uiUnits*Chunk_getUnitSize());
+  if(oChunk==(Chunk_T)-1)
+    return NULL;
+
+  /*Determine where the program break is, and note the end of heap.*/
+  oHeapEnd=(Chunk_T)sbrk(0);
+  /*Set the fields of new chunk.*/
+  Chunk_setUnits(oChunk,uiUnits);
+  oChunk=HeapMgr_Insert(oChunk);
+
+  /*Coalesce if necessary.*/
+  if(oPrevChunk!=NULL)
+    {
+      if(Chunk_getStatus(oPrevChunk)==CHUNK_FREE)
+	{
+	  oChunk=HeapMgr_Remove(oChunk);
+	  oPrevChunk=HeapMgr_Remove(oPrevChunk);
+	  Chunk_setUnits(oPrevChunk,Chunk_getUnits(oPrevChunk)+uiUnits);
+	  oPrevChunk=HeapMgr_Insert(oPrevChunk);
+	  oChunk=oPrevChunk;
+	}
+    }
+  assert(Chunk_isValid(oChunk,oHeapStart,oHeapEnd));
+  return oChunk;
+}
+/*------------------------------------------------------------------*/
+static Chunk_T HeapMgr_useChunk(Chunk_T oChunk,
+				Chunk_T oPrevChunk,size_t uiUnits)
+/* if oChunk is close to teh right size, splice oChunk out of the free
+   list and return oChunk. If oChunk is too big, split it and return 
+   the front end.*/
+{
+  Chunk_T oNewChunk;
+  size_t uiChunkUnits=Chunk_getUnits(oChunk);
+  size_t newUnits=uiChunkUnits-uiUnits;/*When need split.*/
+
+  assert(Chunk_isValid(oChunk,oHeapStart,oHeapEnd));
+  assert(oChunk!=CHUNK_FREE);
+  /*Size is close to the right size.*/
+  if(uiChunkUnits<uiUnits+(size_t)MIN_UNITS_PER_CHUNK )
+    {
+      Chunk_setStatus(oChunk,CHUNK_INUSE);
+      if(oPrevChunk==NULL)
+	{
+	  oFreeList=Chunk_getNextInList(oChunk);
+	}
+      else 
+	{
+	  Chunk_setNextInList(oPrevChunk, Chunk_getNextInList(oChunk));
+	  Chunk_setPrevInList(Chunk_getNextInList(oChunk),oPrevChunk);
+	}
+      return oChunk;
+    } 
+/* Large size,insert tail of it*/
+  oChunk=HeapMgr_Remove(oChunk);
+  /*split*/
+  Chunk_setUnits(oChunk, uiUnits);
+  oNewChunk=Chunk_getNextInMem(oChunk, oHeapStart,oHeapEnd);
+  Chunk_setUnits(oNewChunk,newUnits);
+  /*insert*/
+  oNewChunk=HeapMgr_Insert(oNewChunk);
+  Chunk_setStatus(oNewChunk, CHUNK_FREE);
+  Chunk_setStatus(oChunk,CHUNK_INUSE);
+  return oChunk;
+}
+/*---------------------------------------------------------------*/
+void *HeapMgr_malloc(size_t uiSize)
+
+/* Allocates uiSize bytes and returns a pointer to the allocated memory.
+   The memory is not initialized. If uiSize is 0, then returns NULL. */
+
+{
+  Chunk_T oChunk;
+  Chunk_T oPrevChunk;
+  /*  Chunk_T oPrevPrevChunk; */
+  size_t uiUnits;
+  size_t uiUnitSize;
+  if (uiSize==0)
+    return NULL;
+  /* Initilialize the heap manager if this is the first call. */
+  if(oHeapStart ==NULL)
+    {
+      oHeapStart=(Chunk_T)sbrk(0);
+      oHeapEnd=oHeapStart;
+    }
+  assert(HeapMgr_isValid());
+
+  /*Determine the number of units the new chunk should contain.*/
+  uiUnitSize=Chunk_getUnitSize();
+  uiUnits=((uiSize-1)/uiUnitSize)+1;
+  uiUnits=uiUnits+2;/*Allow room for header and footer.*/
+ 
+  oPrevChunk=NULL;
+  /*  oPrevPrevChunk=NULL;*/
+  for(oChunk=oFreeList;
+      oChunk!=NULL;
+      oChunk=Chunk_getNextInList(oChunk))
+    {
+    /*Current Chunk is big enough*/
+      if(Chunk_getUnits(oChunk)>=uiUnits)
+	{
+	  oChunk=HeapMgr_useChunk(oChunk,oPrevChunk,uiUnits);
+	  assert(HeapMgr_isValid());
+	  return (void*)((char*)oChunk+uiUnitSize);
+	}
+      /*  oPrevPrevChunk=oPrevChunk;*/
+      oPrevChunk=oChunk;
+    }
+      /*The current chunk is not enough, ask OS for more memory.*/
+      oChunk=HeapMgr_getMoreMemory(oPrevChunk,uiUnits);
+      if(oChunk==NULL)
+	{
+	  assert(HeapMgr_isValid());
+	  return NULL;
+	}
+      /*If new chunk coalesced with previous one, reset the previous one.*/
+         if(oChunk==oPrevChunk)
+	   oPrevChunk=oPrevPrevChunk;
+      /* Big enough.*/
+      oChunk=HeapMgr_useChunk(oChunk,NULL,uiUnits);
+      assert(HeapMgr_isValid());
+      return (void*)((char*)oChunk+uiUnitSize);
+}
+
+/*---------------------------------------------------------------------------*/
+
+void HeapMgr_free(void *pv)
+
+/* Frees the memory space pointed to by  pv, which must  have  been
+   returned by a previous call to HeapMgr_malloc(), HeapMgr_calloc()
+   or HeapMgr_realloc(). Otherwise, or if free(pv) has already been
+   called before, undefined behavior occurs. If pv is NULL, no operation
+   is performed. */
+
+{
+  Chunk_T oChunk;
+  Chunk_T oNextChunk;
+  Chunk_T oPrevChunk;
+
+  assert(HeapMgr_isValid());
+
+  if(pv==NULL)
+    return;
+  
+  oChunk=(Chunk_T) ((char*)pv-Chunk_getUnitSize());
+  oNextChunk=Chunk_getNextInMem(oChunk,oHeapStart,oHeapEnd);
+  oPrevChunk=Chunk_getPrevInMem(oChunk,oHeapStart,oHeapEnd);
+  assert(Chunk_isValid(oChunk,oHeapStart,oHeapEnd));
+
+  if(Chunk_getStatus(oChunk)==CHUNK_FREE)/*Check doublefree.*/
+    {
+      fprintf(stderr,"Double free\n");
+      return;
+    }
+  Chunk_setStatus(oChunk,CHUNK_FREE);
+  oChunk=HeapMgr_Insert(oChunk);
+  /*Coalesce if appropriate.*/
+  if(oNextChunk!=NULL)
+    {
+      if(Chunk_getStatus(oNextChunk)==CHUNK_FREE)
+	{
+	  oChunk=HeapMgr_Remove(oChunk);
+	  oNextChunk=HeapMgr_Remove(oNextChunk);
+	  Chunk_setUnits(oChunk,Chunk_getUnits(oChunk)
+			 +Chunk_getUnits(oNextChunk));
+	  oChunk=HeapMgr_Insert(oChunk);
+	}
+    }
+  if(oPrevChunk!=NULL)
+    {
+      if(Chunk_getStatus(oPrevChunk)==CHUNK_FREE)
+	{
+	  oChunk=HeapMgr_Remove(oChunk);
+	  oPrevChunk=HeapMgr_Remove(oPrevChunk);
+	  Chunk_setUnits(oPrevChunk,Chunk_getUnits(oChunk)
+			 +Chunk_getUnits(oPrevChunk));
+	  oPrevChunk=HeapMgr_Insert(oPrevChunk);
+	  oChunk=oPrevChunk;
+	}
+    }
+  assert(HeapMgr_isValid());
+}
+
+/*---------------------------------------------------------------------------*/
+
+void *HeapMgr_calloc(size_t num, size_t uiSize)
+
+/* Allocates memory for an array of num elements of uiSize bytes each and
+   returns a pointer to the allocated memory. The memory is set to zero.
+   If num or uiSize is 0, then HeapMgr_calloc() returns NULL. */
+
+{
+  static Chunk_T *a,oChunk,oNextChunk;
+  int i=0;
+  if(num==0 || uiSize==0)
+  return NULL;
+  a=HeapMgr_malloc(num*uiSize);
+  oChunk=*a;
+  for(i=0;i<num;i++)
+    {
+      Chunk_setUnits(oChunk, uiSize);
+      Chunk_setStatus(oChunk,CHUNK_INUSE);
+      oNextChunk=Chunk_getNextInMem(oChunk, oHeapStart,oHeapEnd);
+      oChunk=oNextChunk;
+    }
+  return *a; 
+}
+/*---------------------------------------------------------------------------*/
+
+void *HeapMgr_realloc(void *pv, size_t uiSize)
+
+/* Changes the size of the memory block pointed to by pv to uiSize bytes.
+   The contents will be unchanged in the range from the start of the region
+   up to the minimum of the old and new sizes.  If the new size is larger than
+   the old size, the added memory will not  be initialized. If pv is NULL, then
+   the call is equivalent to HeapMgr_malloc(size), for all values of uiSize;
+   if uiSize is equal to zero, and pv is not NULL, then the call is
+   equivalent to free(pv). Unless pv is NULL, it must have been returned by
+   an earlier call to HeapMgr_malloc(), HeapMgr_calloc() or HeapMgr_realloc().
+   If the area pointed to was moved, a free(pv) is done. */
+
+{
+  Chunk_T oChunk,oNextChunk,oPrevChunk;
+  Chunk_T oRemainChunk;
+  size_t origSize;
+  oChunk=(Chunk_T) ((char*)pv-Chunk_getUnitSize());
+  origSize=Chunk_getUnits(oChunk);
+  if(pv==NULL)
+    HeapMgr_malloc(uiSize);
+  if(uiSize==0)
+    HeapMgr_free(oChunk);
+  if(origSize>=uiSize)
+    {
+      oChunk=HeapMgr_Remove(oChunk);
+      Chunk_setUnits(oChunk,uiSize);
+      oRemainChunk=Chunk_getNextInMem(oChunk,oHeapStart,oHeapEnd);
+      Chunk_setUnits(oRemainChunk, origSize-uiSize);
+      oChunk=HeapMgr_useChunk(oChunk,NULL,uiSize);
+      oRemainChunk=HeapMgr_Insert(oRemainChunk);
+      /*If possible, coalesce.*/
+      oNextChunk=Chunk_getNextInMem(oRemainChunk,oHeapStart,oHeapEnd);
+      oPrevChunk=Chunk_getPrevInMem(oRemainChunk,oHeapStart,oHeapEnd);
+      if(oNextChunk!=NULL)
+	{
+	  if(Chunk_getStatus(oNextChunk)==CHUNK_FREE)
+	    {
+	      oRemainChunk=HeapMgr_Remove(oRemainChunk);
+	      oNextChunk=HeapMgr_Remove(oNextChunk);
+	      Chunk_setUnits(oRemainChunk,Chunk_getUnits(oRemainChunk)
+			     +Chunk_getUnits(oNextChunk));
+	      oRemainChunk=HeapMgr_Insert(oRemainChunk);
+	    }
+	}
+      if(oPrevChunk!=NULL)
+	{
+	  if(Chunk_getStatus(oPrevChunk)==CHUNK_FREE)
+	    {
+	      oRemainChunk=HeapMgr_Remove(oRemainChunk);
+	      oPrevChunk=HeapMgr_Remove(oPrevChunk);
+	      Chunk_setUnits(oPrevChunk,Chunk_getUnits(oRemainChunk)
+			     +Chunk_getUnits(oPrevChunk));
+	      oPrevChunk=HeapMgr_Insert(oPrevChunk);
+	      oRemainChunk=oPrevChunk;
+	    }
+	}
+      assert(HeapMgr_isValid());
+    }
+  else
+    {
+      /*The current chunk is not enough, ask OS for more memory.*/
+      oChunk=HeapMgr_getMoreMemory(Chunk_getPrevInList(oChunk),uiSize);
+      if(oChunk==NULL)
+	{
+	  assert(HeapMgr_isValid());
+	  return NULL;
+	}
+       /* Big enough.*/
+      oChunk=HeapMgr_useChunk(oChunk,NULL,uiSize);
+      assert(HeapMgr_isValid());
+      return (void*)((char*)oChunk+Chunk_getUnitSize());
+    }
+  return NULL;
+}
